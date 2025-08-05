@@ -1,0 +1,5 @@
+.idea/
+bin/
+localdb/data
+localdb/log.txt
+go.sum
