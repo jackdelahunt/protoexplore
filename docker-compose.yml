@@ -1,0 +1,28 @@
+services:
+  client-server:
+    container_name: client-server
+    build:
+      context: .
+      dockerfile: client-server.Dockerfile
+    depends_on:
+      - database
+    environment:
+      POSTGRES_HOST: database
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: pinapple
+      POSTGRES_DB: exploredb
+      POSTGRES_PORT: 5432
+      SERVER_HOST: localhost
+      SERVER_PORT: 50051
+
+  database:
+    container_name: database
+    build:
+      context: .
+      dockerfile: database.Dockerfile
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: pinapple
+      POSTGRES_DB: exploredb
+    ports:
+      - "5432:5432"

@@ -21,21 +21,47 @@ var insertDecisionSQL string
 //go:embed queries/get_all_likes_received.sql
 var getAllLikesReceivedSQL string
 
+//go:embed queries/get_all_likes_received_start.sql
+var getAllLikesReceivedStartSQL string
+
+//go:embed queries/get_all_likes_received_paged.sql
+var getAllLikesReceivedPagedSQL string
+
 //go:embed queries/get_all_likes_sent.sql
 var getAllLikesSentSQL string
 
 //go:embed queries/get_liked_count.sql
 var getLikedCountSQL string
 
-func ConnectToDB(ctx context.Context) (*pgx.Conn, error) {
-	url := "postgres://postgres:@localhost:5432/exploredb"
+//go:embed queries/get_decision.sql
+var getDecisionSQL string
 
-	db, err := pgx.Connect(ctx, url)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintf("Error connecting to database: %v", err))
+const PaginationSize int = 10
+
+func ConnectToDB(ctx context.Context, host string, user string, password string, database string, port string) (*pgx.Conn, error) {
+	url := fmt.Sprintf("postgres://%v:%v@%v:%v/%v?sslmode=disable", user, password, host, port, database)
+
+	// if the server is started at the same time as the database it may not
+	// be ready for connections and the server would just fail. This allows for
+	// retrying to establish a connection to make sure if it is not connecting
+	// it is something actually going wrong
+
+	retryCount := 15
+	retryDelay := 1 * time.Second
+
+	for i := range retryCount {
+		db, err := pgx.Connect(ctx, url)
+		if err != nil {
+			log.Printf("[%v] failed to connect to database, will retry: %v\n", i, err.Error())
+
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		return db, nil
 	}
 
-	return db, nil
+	return nil, errors.New("failed to many connection attempts")
 }
 
 type User struct {
@@ -69,36 +95,51 @@ func InsertDecision(ctx context.Context, db *pgx.Conn, decision Decision) (Decis
 		QueryRow(ctx, insertDecisionSQL, decision.FromUser, decision.ToUser, decision.Liked).
 		Scan(&newDecision.Id, &newDecision.CreatedAt, &newDecision.FromUser, &newDecision.ToUser, &newDecision.Liked)
 	if err != nil {
-		log.Fatalf("failed to insert decision: %v", err)
+		return Decision{}, err
 	}
 
 	return newDecision, nil
 }
 
-func UpdateDecision(ctx context.Context, db *pgx.Conn, decision Decision) (Decision, error) {
-	return decision, nil
-}
-
-func GetAllLikes(ctx context.Context, db *pgx.Conn, user User) ([]User, error) {
-	rows, err := db.Query(ctx, getAllLikesReceivedSQL, user.Id)
+func GetAllLikesStart(ctx context.Context, db *pgx.Conn, user User) ([]User, string, error) {
+	rows, err := db.Query(ctx, getAllLikesReceivedStartSQL, user.Id, PaginationSize)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	defer rows.Close()
 
-	users, err := rowsToUserList(rows)
+	users, paginationToken, err := RowsToUserList(rows)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	return users, nil
+	return users, paginationToken, nil
+}
+
+func GetAllLikesPaged(ctx context.Context, db *pgx.Conn, user User, paginationToken string) ([]User, string, error) {
+	rows, err := db.Query(ctx, getAllLikesReceivedPagedSQL, user.Id, paginationToken, PaginationSize)
+	if err != nil {
+		return nil, "", err
+	}
+
+	defer rows.Close()
+
+	users, newPaginationToken, err := RowsToUserList(rows)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return users, newPaginationToken, nil
 }
 
 func GetAllLikesOneWay(ctx context.Context, db *pgx.Conn, user User) ([]User, error) {
-	// ChatGPT could of done this in one query but I could only get as
-	// far as this where I check for the like both to and from the user and
-	// filter it on the server :[
+	// I couldn't figure out how to do this query how (I think) it is intended
+	// where its all done in the query I could only get as far as this where I
+	// check for the like both to and from the user and filter it on the server :[
+
+	// This also means I wasn't able to do paging for this has it is making
+	// two queries in one. Or atleast I couldn't figure out how to
 
 	var likesRecived []User
 	var likesSent []User
@@ -112,7 +153,7 @@ func GetAllLikesOneWay(ctx context.Context, db *pgx.Conn, user User) ([]User, er
 
 		defer rows.Close()
 
-		likesRecived, err = rowsToUserList(rows)
+		likesRecived, _, err = RowsToUserList(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -126,7 +167,7 @@ func GetAllLikesOneWay(ctx context.Context, db *pgx.Conn, user User) ([]User, er
 
 		defer rows.Close()
 
-		likesSent, err = rowsToUserList(rows)
+		likesSent, _, err = RowsToUserList(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -149,8 +190,8 @@ func GetAllLikesOneWay(ctx context.Context, db *pgx.Conn, user User) ([]User, er
 	return likesRecivedButNotSent, nil
 }
 
-func GetLikeCount(ctx context.Context, db *pgx.Conn, user User) (int, error) {
-	var count int
+func GetLikeCount(ctx context.Context, db *pgx.Conn, user User) (uint64, error) {
+	var count uint64
 
 	err := db.QueryRow(ctx, getLikedCountSQL, user.Id).Scan(&count)
 	if err != nil {
@@ -160,30 +201,35 @@ func GetLikeCount(ctx context.Context, db *pgx.Conn, user User) (int, error) {
 	return count, nil
 }
 
-func rowsToUserList(rows pgx.Rows) ([]User, error) {
+func GetDecision(ctx context.Context, db *pgx.Conn, decision Decision, out *Decision) (bool, error) {
+	err := db.
+		QueryRow(ctx, getDecisionSQL, decision.FromUser, decision.ToUser).
+		Scan(&out.Id, &out.CreatedAt, &out.FromUser, &out.ToUser, &out.Liked)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return true, nil
+}
+
+func RowsToUserList(rows pgx.Rows) ([]User, string, error) {
 	var users []User
+	var paginationToken string
+
 	for rows.Next() {
 		var u User
 		if err := rows.Scan(&u.Id, &u.CreatedAt); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 
 		users = append(users, u)
+		paginationToken = string(u.Id)
 	}
 
-	return users, nil
-}
-
-func rowsToUserSet(rows pgx.Rows) (map[UUID]bool, error) {
-	var users map[UUID]bool
-	for rows.Next() {
-		var u User
-		if err := rows.Scan(&u.Id, &u.CreatedAt); err != nil {
-			return nil, err
-		}
-
-		users[u.Id] = true
-	}
-
-	return users, nil
+	return users, paginationToken, nil
 }

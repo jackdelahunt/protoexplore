@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackdelahunt/protoexplore/explore"
@@ -9,28 +10,8 @@ import (
 	"log"
 	"math/rand/v2"
 	"net"
+	"os"
 )
-
-type ExploreServer struct {
-	explore.UnimplementedExploreServiceServer
-}
-
-func (s ExploreServer) ListLikedYou(ctx context.Context, request *explore.ListLikedYouRequest) (*explore.ListLikedYouResponse, error) {
-	return nil, nil
-}
-func (s ExploreServer) ListNewLikedYou(ctx context.Context, request *explore.ListLikedYouRequest) (*explore.ListLikedYouResponse, error) {
-	return nil, nil
-}
-func (s ExploreServer) CountLikedYou(ctx context.Context, request *explore.CountLikedYouRequest) (*explore.CountLikedYouResponse, error) {
-	return &explore.CountLikedYouResponse{Count: 100}, nil
-}
-func (s ExploreServer) PutDecision(ctx context.Context, request *explore.PutDecisionRequest) (*explore.PutDecisionResponse, error) {
-	return nil, nil
-}
-
-func NewServer() *ExploreServer {
-	return &ExploreServer{}
-}
 
 func GenerateUsers(ctx context.Context, db *pgx.Conn, count int) ([]User, error) {
 	users := make([]User, count)
@@ -43,6 +24,8 @@ func GenerateUsers(ctx context.Context, db *pgx.Conn, count int) ([]User, error)
 
 		users[i] = user
 	}
+
+	log.Printf("generated %v users\n", len(users))
 
 	return users, nil
 }
@@ -88,101 +71,97 @@ func GenerateDecisions(ctx context.Context, db *pgx.Conn, users []User) ([]Decis
 		}
 	}
 
+	log.Printf("generated %v decisions\n", len(decisions))
+
 	return decisions, nil
+}
+
+func RunServer(server *ExploreServer) error {
+	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%v", server.Port))
+	if err != nil {
+		return err
+	}
+
+	log.Printf(fmt.Sprintf("listening on %v\n", listener.Addr().String()))
+
+	var opts []grpc.ServerOption
+	grpcServer := grpc.NewServer(opts...)
+	explore.RegisterExploreServiceServer(grpcServer, server)
+
+	err = grpcServer.Serve(listener)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func WriteClientId(users []User) error {
+	// cursed way of giving the client an id to use in requests,
+	// because I think that I shouldn't change the API
+	if len(users) <= 0 {
+		return errors.New("no users provided to create client id file")
+	}
+
+	path := "bin/client.id"
+	id := users[0].Id
+
+	err := os.WriteFile(path, []byte(id), 0644)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("wrote client id to \"%v\"\n", path)
+
+	return nil
 }
 
 func main() {
 	ctx := context.Background()
+	log.SetPrefix("[SERVER]: ")
 
-	db, err := ConnectToDB(ctx)
+	/* connect to postgres */
+	db, err := ConnectToDB(ctx,
+		os.Getenv("POSTGRES_HOST"),
+		os.Getenv("POSTGRES_USER"),
+		os.Getenv("POSTGRES_PASSWORD"),
+		os.Getenv("POSTGRES_DB"),
+		os.Getenv("POSTGRES_PORT"),
+	)
+
 	if err != nil {
 		log.Fatalf("failed to connect to database: %v", err)
 	}
 
+	log.Printf("connected to database %v\n", db.PgConn().Conn().RemoteAddr().String())
+
 	defer db.Close(ctx)
 
-	if true { // generate data
-		users, err := GenerateUsers(ctx, db, 200)
-		if err != nil {
-			log.Fatalf("failed to generate users: %v", err)
-		}
-
-		_, err = GenerateDecisions(ctx, db, users)
-		if err != nil {
-			log.Fatalf("failed to generate decisions: %v", err)
-		}
-	}
-
-	if false { // make queries
-		u := User{
-			Id: "f2c1dfad-a3d1-427d-8418-da12024f7466",
-		}
-
-		users, err := GetAllLikes(ctx, db, u)
-		if err != nil {
-			log.Fatalf("failed to get all likes: %v", err)
-		}
-
-		fmt.Printf("All likes received %v\n", len(users))
-		for _, user := range users {
-			fmt.Println(user)
-		}
-
-		users, err = GetAllLikesOneWay(ctx, db, u)
-		if err != nil {
-			log.Fatalf("failed to get all likes: %v", err)
-		}
-
-		fmt.Printf("All likes received but not sent %v\n", len(users))
-		for _, user := range users {
-			fmt.Println(user)
-		}
-
-		count, err := GetLikeCount(ctx, db, u)
-		if err != nil {
-			log.Fatalf("failed to get like counts: %v", err)
-		}
-
-		fmt.Printf("Like received count %v\n", count)
-	}
-
-	return
-
-	user, err := InsertUser(ctx, db)
+	/* Generate users and decisions */
+	users, err := GenerateUsers(ctx, db, 50)
 	if err != nil {
-		log.Fatalf("failed to insert new user: %v", err)
+		log.Fatalf("error while generating users: %v", err)
 	}
 
-	fmt.Printf("Created user: %v\n", user)
-
-	d := Decision{
-		FromUser: "a505623b-0b4d-47d8-ace3-f0235930345c",
-		ToUser:   "232679e1-d0a0-4b3f-a882-278c53ee14db",
-		Liked:    false,
-	}
-
-	nd, err := InsertDecision(ctx, db, d)
+	_, err = GenerateDecisions(ctx, db, users)
 	if err != nil {
-		log.Fatalf("failed to insert new decision: %v", err)
+		log.Fatalf("error while generating decisions: %v", err)
 	}
 
-	fmt.Printf("Created decision: %v\n", nd)
-
-	return
-
-	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", 50051))
+	/* Create client ID file */
+	err = WriteClientId(users)
 	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
+		log.Fatalf("error while writing client id file: %v", err)
 	}
 
-	println("Listening on " + listener.Addr().String())
+	/* Run the grpc server */
+	server := ExploreServer{
+		Port:     os.Getenv("SERVER_PORT"),
+		Database: db,
+	}
 
-	var opts []grpc.ServerOption
-	grpcServer := grpc.NewServer(opts...)
-	explore.RegisterExploreServiceServer(grpcServer, NewServer())
-
-	err = grpcServer.Serve(listener)
+	err = RunServer(&server)
 	if err != nil {
-		log.Fatalf("grpc server encountered an error : %v", err)
+		log.Fatalf("the server encountered an error: %v", err)
 	}
 }
